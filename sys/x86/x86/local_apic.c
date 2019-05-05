@@ -1641,6 +1641,7 @@ static void
 native_apic_free_vector(u_int apic_id, u_int vector, u_int irq)
 {
 	struct thread *td;
+	int prev;
 
 	KASSERT(vector >= APIC_IO_INTS && vector != IDT_SYSCALL &&
 	    vector <= APIC_IO_INTS + APIC_NUM_IOINTS,
@@ -1660,9 +1661,7 @@ native_apic_free_vector(u_int apic_id, u_int vector, u_int irq)
 	td = curthread;
 	if (!rebooting) {
 		thread_lock(td);
-		if (sched_is_bound(td))
-			panic("apic_free_vector: Thread already bound.\n");
-		sched_bind(td, apic_cpuid(apic_id));
+		prev = sched_bind_nested(apic_cpuid(apic_id));
 		thread_unlock(td);
 	}
 	mtx_lock_spin(&icu_lock);
@@ -1670,7 +1669,7 @@ native_apic_free_vector(u_int apic_id, u_int vector, u_int irq)
 	mtx_unlock_spin(&icu_lock);
 	if (!rebooting) {
 		thread_lock(td);
-		sched_unbind(td);
+		sched_unbind_nested(prev);
 		thread_unlock(td);
 	}
 }

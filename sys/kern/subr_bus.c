@@ -31,9 +31,11 @@ __FBSDID("$FreeBSD$");
 
 #include "opt_bus.h"
 #include "opt_ddb.h"
+#include "opt_vm.h"
 
 #include <sys/param.h>
 #include <sys/conf.h>
+#include <sys/cpuset.h>
 #include <sys/eventhandler.h>
 #include <sys/filio.h>
 #include <sys/lock.h>
@@ -52,6 +54,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/random.h>
 #include <sys/rman.h>
 #include <sys/sbuf.h>
+#include <sys/sched.h>
 #include <sys/selinfo.h>
 #include <sys/signalvar.h>
 #include <sys/smp.h>
@@ -2930,6 +2933,11 @@ device_probe_and_attach(device_t dev)
 	return error;
 }
 
+#if defined(EARLY_AP_STARTUP) && defined(NUMA) && defined(UMA_FIRSTTOUCH)
+#define DEVICE_ATTACH_NUMA
+static u_int device_attach_numa = 1;
+TUNABLE_INT("dev.attach_numa", &device_attach_numa);
+#endif
 /**
  * @brief Attach a device driver to a device
  *
@@ -2954,6 +2962,9 @@ device_attach(device_t dev)
 {
 	uint64_t attachtime;
 	uint16_t attachentropy;
+#ifdef DEVICE_ATTACH_NUMA
+	int domain, prev;
+#endif
 	int error;
 
 	if (resource_disabled(dev->driver->name, dev->unit)) {
@@ -2962,6 +2973,14 @@ device_attach(device_t dev)
 			 device_printf(dev, "disabled via hints entry\n");
 		return (ENXIO);
 	}
+#ifdef DEVICE_ATTACH_NUMA
+	if (device_attach_numa != 0 && bus_get_domain(dev, &domain) == 0) {
+		thread_lock(curthread);
+		prev = sched_bind_nested(CPU_FFS(&cpuset_domain[domain]));
+		thread_unlock(curthread);
+	} else
+		domain = -1;
+#endif
 
 	device_sysctl_init(dev);
 	if (!device_is_quiet(dev))
@@ -2977,6 +2996,7 @@ device_attach(device_t dev)
 		device_sysctl_fini(dev);
 		KASSERT(dev->busy == 0, ("attach failed but busy"));
 		dev->state = DS_NOTPRESENT;
+		goto out;
 		return (error);
 	}
 	dev->flags |= DF_ATTACHED_ONCE;
@@ -2993,8 +3013,19 @@ device_attach(device_t dev)
 	dev->flags &= ~DF_DONENOMATCH;
 	EVENTHANDLER_DIRECT_INVOKE(device_attach, dev);
 	devadded(dev);
-	return (0);
+	error = 0;
+out:
+#ifdef DEVICE_ATTACH_NUMA
+	if (domain != -1) {
+		thread_lock(curthread);
+		sched_unbind_nested(prev);
+		thread_unlock(curthread);
+	}
+#endif
+
+	return (error);
 }
+#undef DEVICE_ATTACH_BIND
 
 /**
  * @brief Detach a driver from a device

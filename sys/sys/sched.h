@@ -154,6 +154,34 @@ int	sched_is_bound(struct thread *td);
 void	sched_affinity(struct thread *td);
 
 /*
+ * Support nesting CPU binding by returning the previous bound CPU to
+ * the caller.
+ */
+static __inline int
+sched_bind_nested(int cpu)
+{
+	int prev;
+
+	if (sched_is_bound(curthread))
+		prev = PCPU_GET(cpuid);
+	else
+		prev = -1;
+	sched_bind(curthread, cpu);
+
+	return (prev);
+}
+
+static __inline void
+sched_unbind_nested(int cpu)
+{
+
+	if (cpu != -1)
+		sched_bind(curthread, cpu);
+	else
+		sched_unbind(curthread);
+}
+
+/*
  * These procedures tell the process data structure allocation code how
  * many bytes to actually allocate.
  */
