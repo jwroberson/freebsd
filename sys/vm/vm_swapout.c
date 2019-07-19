@@ -214,11 +214,13 @@ vm_swapout_object_deactivate_pages(pmap_t pmap, vm_object_t first_object,
 			 * no harm done if a wiring appears while we are
 			 * attempting to deactivate the page.
 			 */
-			if (vm_page_busied(p) || vm_page_wired(p))
+			if (vm_page_wired(p) || vm_page_tryxbusy(p) == 0)
 				continue;
 			VM_CNT_INC(v_pdpages);
-			if (!pmap_page_exists_quick(pmap, p))
+			if (!pmap_page_exists_quick(pmap, p)) {
+				vm_page_xunbusy(p);
 				continue;
+			}
 			act_delta = pmap_ts_referenced(p);
 			vm_page_lock(p);
 			if ((p->aflags & PGA_REFERENCED) != 0) {
@@ -250,6 +252,7 @@ vm_swapout_object_deactivate_pages(pmap_t pmap, vm_object_t first_object,
 			} else if (vm_page_inactive(p))
 				(void)vm_page_try_remove_all(p);
 			vm_page_unlock(p);
+			vm_page_xunbusy(p);
 		}
 		if ((backing_object = object->backing_object) == NULL)
 			goto unlock_return;
