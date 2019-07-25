@@ -662,6 +662,11 @@ void vm_page_assert_locked_KBI(vm_page_t m, const char *file, int line);
 void vm_page_lock_assert_KBI(vm_page_t m, int a, const char *file, int line);
 #endif
 
+#define	vm_page_assert_busied(m)					\
+	KASSERT(vm_page_busied(m),					\
+	    ("vm_page_assert_busied: page %p not busy @ %s:%d", \
+	    (m), __FILE__, __LINE__))
+
 #define	vm_page_assert_sbusied(m)					\
 	KASSERT(vm_page_sbusied(m),					\
 	    ("vm_page_assert_sbusied: page %p not shared busy @ %s:%d", \
