@@ -1203,6 +1203,8 @@ vm_page_putfake(vm_page_t m)
 	KASSERT((m->oflags & VPO_UNMANAGED) != 0, ("managed %p", m));
 	KASSERT((m->flags & PG_FICTITIOUS) != 0,
 	    ("vm_page_putfake: bad page %p", m));
+	if (vm_page_xbusied(m))
+		vm_page_xunbusy(m);
 	uma_zfree(fakepg_zone, m);
 }
 
@@ -1495,8 +1497,7 @@ vm_page_object_remove(vm_page_t m)
 	VM_OBJECT_ASSERT_WLOCKED(object);
 	KASSERT((m->ref_count & VPRC_OBJREF) != 0,
 	    ("page %p is missing its object ref", m));
-	if (vm_page_xbusied(m))
-		vm_page_xunbusy(m);
+
 	mrem = vm_radix_remove(&object->rtree, m->pindex);
 	KASSERT(mrem == m, ("removed page %p, expected page %p", mrem, m));
 
@@ -3513,7 +3514,7 @@ vm_page_free_prep(vm_page_t m)
 	VM_CNT_INC(v_tfree);
 
 	if (vm_page_sbusied(m))
-		panic("vm_page_free_prep: freeing busy page %p", m);
+		panic("vm_page_free_prep: freeing shared busy page %p", m);
 
 	if (m->object != NULL) {
 		vm_page_object_remove(m);
@@ -3529,6 +3530,9 @@ vm_page_free_prep(vm_page_t m)
 		m->object = NULL;
 		m->ref_count -= VPRC_OBJREF;
 	}
+
+	if (vm_page_xbusied(m))
+		vm_page_xunbusy(m);
 
 	/*
 	 * If fictitious remove object association and
