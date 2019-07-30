@@ -450,7 +450,7 @@ shm_dotruncate(struct shmfd *shmfd, off_t length)
 retry:
 			m = vm_page_grab(object, idx, VM_ALLOC_NOCREAT);
 			if (m != NULL) {
-				MPASS(m->valid == VM_PAGE_BITS_ALL);
+				MPASS(vm_page_all_valid(m));
 			} else if (vm_pager_has_page(object, idx, NULL, NULL)) {
 				m = vm_page_alloc(object, idx,
 				    VM_ALLOC_NORMAL | VM_ALLOC_WAITFAIL);
@@ -476,7 +476,7 @@ retry:
 			}
 			if (m != NULL) {
 				pmap_zero_page_area(m, base, PAGE_SIZE - base);
-				KASSERT(m->valid == VM_PAGE_BITS_ALL,
+				KASSERT(vm_page_all_valid(m),
 				    ("shm_dotruncate: page %p is invalid", m));
 				vm_page_dirty(m);
 				vm_page_xunbusy(m);

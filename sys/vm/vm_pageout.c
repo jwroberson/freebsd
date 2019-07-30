@@ -460,7 +460,7 @@ vm_pageout_flush(vm_page_t *mc, int count, int flags, int mreq, int *prunlen,
 	 * edge case with file fragments.
 	 */
 	for (i = 0; i < count; i++) {
-		KASSERT(mc[i]->valid == VM_PAGE_BITS_ALL,
+		KASSERT(vm_page_all_valid(mc[i]),
 		    ("vm_pageout_flush: partially invalid page %p index %d/%d",
 			mc[i], i, count));
 		KASSERT((mc[i]->aflags & PGA_WRITEABLE) == 0,
@@ -820,7 +820,7 @@ recheck:
 		 * Invalid pages can be easily freed.  They cannot be
 		 * mapped; vm_page_free() asserts this.
 		 */
-		if (m->valid == 0)
+		if (vm_page_none_valid(m))
 			goto free_page;
 
 		/*
@@ -1551,7 +1551,7 @@ recheck:
 		 * Invalid pages can be easily freed. They cannot be
 		 * mapped, vm_page_free() asserts this.
 		 */
-		if (m->valid == 0)
+		if (vm_page_none_valid(m))
 			goto free_page;
 
 		/*
