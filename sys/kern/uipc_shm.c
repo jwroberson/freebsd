@@ -176,6 +176,17 @@ uiomove_object_page(vm_object_t obj, size_t len, struct uio *uio)
 	offset = uio->uio_offset & PAGE_MASK;
 	tlen = MIN(PAGE_SIZE - offset, len);
 
+	m = vm_page_grab_unlocked(obj, idx,
+	    VM_ALLOC_SBUSY | VM_ALLOC_IGN_SBUSY | VM_ALLOC_NOCREAT);
+	if (m != NULL) {
+		/*
+		 * Write should set valid and not require valid if it
+		 * is covering the whole page? XXX
+		 */
+		if (vm_page_all_valid(m))
+			goto move;
+		vm_page_sunbusy(m);
+	}
 	VM_OBJECT_WLOCK(obj);
 
 	/*
@@ -183,21 +194,22 @@ uiomove_object_page(vm_object_t obj, size_t len, struct uio *uio)
 	 * page: use zero_region.  This is intended to avoid instantiating
 	 * pages on read from a sparse region.
 	 */
-	if (uio->uio_rw == UIO_READ && vm_page_lookup(obj, idx) == NULL &&
+	m = vm_page_lookup(obj, idx);
+	if (uio->uio_rw == UIO_READ && m == NULL &&
 	    !vm_pager_has_page(obj, idx, NULL, NULL)) {
 		VM_OBJECT_WUNLOCK(obj);
 		return (uiomove(__DECONST(void *, zero_region), tlen, uio));
 	}
 
 	/*
-	 * Parallel reads of the page content from disk are prevented
-	 * by exclusive busy.
-	 *
 	 * Although the tmpfs vnode lock is held here, it is
 	 * nonetheless safe to sleep waiting for a free page.  The
 	 * pageout daemon does not need to acquire the tmpfs vnode
 	 * lock to page out tobj's pages because tobj is a OBJT_SWAP
 	 * type object.
+	 */
+	/*
+	 * XXX Count.  shared busy is not quite right.
 	 */
 	rv = vm_page_grab_valid(&m, obj, idx,
 	    VM_ALLOC_NORMAL | VM_ALLOC_SBUSY | VM_ALLOC_IGN_SBUSY);
@@ -208,6 +220,8 @@ uiomove_object_page(vm_object_t obj, size_t len, struct uio *uio)
 		return (EIO);
 	}
 	VM_OBJECT_WUNLOCK(obj);
+
+move:
 	error = uiomove_fromphys(&m, offset, tlen, uio);
 	if (uio->uio_rw == UIO_WRITE && error == 0)
 		vm_page_set_dirty(m);
