@@ -160,51 +160,67 @@ uiomove_object_page(vm_object_t obj, size_t len, struct uio *uio)
 	vm_pindex_t idx;
 	size_t tlen;
 	int error, offset, rv;
+	bool rlock;
 
 	idx = OFF_TO_IDX(uio->uio_offset);
 	offset = uio->uio_offset & PAGE_MASK;
 	tlen = MIN(PAGE_SIZE - offset, len);
 
-	VM_OBJECT_WLOCK(obj);
+	if (uio->uio_rw == UIO_READ) {
+		rlock = true;
+		VM_OBJECT_RLOCK(obj);
+	} else {
+		VM_OBJECT_WLOCK(obj);
+		rlock = false;
+	}
 
 	/*
 	 * Read I/O without either a corresponding resident page or swap
 	 * page: use zero_region.  This is intended to avoid instantiating
 	 * pages on read from a sparse region.
 	 */
-	if (uio->uio_rw == UIO_READ && vm_page_lookup(obj, idx) == NULL &&
+	m = vm_page_lookup(obj, idx);
+	if (uio->uio_rw == UIO_READ && m == NULL &&
 	    !vm_pager_has_page(obj, idx, NULL, NULL)) {
-		VM_OBJECT_WUNLOCK(obj);
+		VM_OBJECT_RUNLOCK(obj);
 		return (uiomove(__DECONST(void *, zero_region), tlen, uio));
 	}
 
 	/*
-	 * Parallel reads of the page content from disk are prevented
-	 * by exclusive busy.
-	 *
 	 * Although the tmpfs vnode lock is held here, it is
 	 * nonetheless safe to sleep waiting for a free page.  The
 	 * pageout daemon does not need to acquire the tmpfs vnode
 	 * lock to page out tobj's pages because tobj is a OBJT_SWAP
 	 * type object.
 	 */
-	rv = vm_page_grab_valid(&m, obj, idx,
-	    VM_ALLOC_NORMAL | VM_ALLOC_WIRED | VM_ALLOC_NOBUSY);
-	if (rv != VM_PAGER_OK) {
-		VM_OBJECT_WUNLOCK(obj);
-		printf("uiomove_object: vm_obj %p idx %jd pager error %d\n",
-		    obj, idx, rv);
-		return (EIO);
+	if (m == NULL || !vm_page_all_valid(m) || !vm_page_trysbusy(m)) {
+		if (uio->uio_rw == UIO_READ && !VM_OBJECT_TRYUPGRADE(obj)) {
+			VM_OBJECT_RUNLOCK(obj);
+			VM_OBJECT_WLOCK(obj);
+		}
+		rlock = false;
+		rv = vm_page_grab_valid(&m, obj, idx,
+		    VM_ALLOC_NORMAL | VM_ALLOC_SBUSY | VM_ALLOC_IGN_SBUSY);
+		if (rv != VM_PAGER_OK) {
+			VM_OBJECT_WUNLOCK(obj);
+			printf("uiomove_object: vm_obj %p idx %jd pager error %d\n",
+			    obj, idx, rv);
+			return (EIO);
+		}
 	}
-	VM_OBJECT_WUNLOCK(obj);
-	error = uiomove_fromphys(&m, offset, tlen, uio);
-	if (uio->uio_rw == UIO_WRITE && error == 0) {
-		VM_OBJECT_WLOCK(obj);
-		vm_page_dirty(m);
+	if (uio->uio_rw == UIO_WRITE)
 		vm_pager_page_unswapped(m);
+	if (rlock)
+		VM_OBJECT_RUNLOCK(obj);
+	else
 		VM_OBJECT_WUNLOCK(obj);
-	}
-	vm_page_unwire(m, PQ_ACTIVE);
+	error = uiomove_fromphys(&m, offset, tlen, uio);
+	if (uio->uio_rw == UIO_WRITE && error == 0)
+		vm_page_dirty(m);
+	vm_page_lock(m);
+	vm_page_activate(m);
+	vm_page_unlock(m);
+	vm_page_sunbusy(m);
 
 	return (error);
 }
