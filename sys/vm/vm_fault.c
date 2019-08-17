@@ -179,11 +179,10 @@ unlock_vp(struct faultstate *fs)
 }
 
 static void
-unlock_and_deallocate(struct faultstate *fs)
+fault_deallocate(struct faultstate *fs)
 {
 
 	vm_object_pip_wakeup(fs->object);
-	VM_OBJECT_WUNLOCK(fs->object);
 	if (fs->object != fs->first_object) {
 		VM_OBJECT_WLOCK(fs->first_object);
 		vm_page_free(fs->first_m);
@@ -194,6 +193,14 @@ unlock_and_deallocate(struct faultstate *fs)
 	vm_object_deallocate(fs->first_object);
 	unlock_map(fs);
 	unlock_vp(fs);
+}
+
+static void
+unlock_and_deallocate(struct faultstate *fs)
+{
+
+	VM_OBJECT_WUNLOCK(fs->object);
+	fault_deallocate(fs);
 }
 
 static void
@@ -1171,10 +1178,12 @@ readrest:
 				    fs.object, OFF_TO_IDX(
 				    fs.first_object->backing_object_offset));
 #endif
+				VM_OBJECT_WUNLOCK(fs.object);
 				fs.first_m = fs.m;
 				fs.m = NULL;
 				VM_CNT_INC(v_cow_optim);
 			} else {
+				VM_OBJECT_WUNLOCK(fs.object);
 				/*
 				 * Oh, well, lets copy it.
 				 */
@@ -1195,7 +1204,6 @@ readrest:
 			 * conditional
 			 */
 			vm_object_pip_wakeup(fs.object);
-			VM_OBJECT_WUNLOCK(fs.object);
 
 			/*
 			 * We only try to prefault read-only mappings to the
@@ -1315,7 +1323,6 @@ readrest:
 		vm_fault_prefault(&fs, vaddr,
 		    faultcount > 0 ? behind : PFBAK,
 		    faultcount > 0 ? ahead : PFFOR, false);
-	VM_OBJECT_WLOCK(fs.object);
 
 	/*
 	 * If the page is not wired down, then put it where the pageout daemon
@@ -1337,7 +1344,7 @@ readrest:
 	/*
 	 * Unlock everything, and return
 	 */
-	unlock_and_deallocate(&fs);
+	fault_deallocate(&fs);
 	if (hardfault) {
 		VM_CNT_INC(v_io_faults);
 		curthread->td_ru.ru_majflt++;
