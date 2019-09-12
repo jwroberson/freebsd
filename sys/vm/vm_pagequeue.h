@@ -120,6 +120,14 @@ struct vm_domain {
 	/* Paging control variables, used within single threaded page daemon. */
 	struct pidctrl vmd_pid;		/* Pageout controller. */
 	boolean_t vmd_oom;
+	u_int vmd_inactive_threads;
+	u_int vmd_inactive_shortage;		/* per-thread shortage. */
+	volatile u_int vmd_inactive_running;	/* Number of inactive threads.*/
+	volatile u_int vmd_inactive_starting;	/* Number threads started. */
+	volatile u_int vmd_addl_shortage;	/* Shortage accumulator. */
+	volatile u_int vmd_inactive_freed;	/* Successful inactive frees. */
+	volatile u_int vmd_inactive_us;		/* Microseconds for above. */
+	u_int vmd_inactive_pps;		/* Exponential decay frees/second. */
 	int vmd_oom_seq;
 	int vmd_last_active_scan;
 	struct vm_page vmd_markers[PQ_COUNT]; /* (q) markers for queue scans */

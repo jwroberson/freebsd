@@ -131,6 +131,10 @@ struct xswdev {
 #endif
 #define PHYS_AVAIL_COUNT        (PHYS_AVAIL_ENTRIES + 2)
 
+#ifndef	PAGEOUT_THREADS
+#define	PAGEOUT_THREADS		1
+#endif
+
 #ifndef ASSEMBLER
 #ifdef _KERNEL
 #define num_pages(x) \

@@ -180,16 +180,19 @@ refcount_release_if_gt(volatile u_int *count, u_int n)
 {
 	u_int old;
 
-	KASSERT(n > 0,
-	    ("refcount_release_if_gt: Use refcount_release for final ref"));
+	if (n == 0)
+		atomic_thread_fence_rel();
 	old = *count;
 	for (;;) {
 		if (REFCOUNT_COUNT(old) <= n)
 			return (false);
 		if (__predict_false(REFCOUNT_SATURATED(old)))
 			return (true);
-		if (atomic_fcmpset_int(count, &old, old - 1))
+		if (atomic_fcmpset_int(count, &old, old - 1)) {
+			if (__predict_false(REFCOUNT_COUNT(old) == 1))
+				return (refcount_release_last(count, 1, old));
 			return (true);
+		}
 	}
 }
 
