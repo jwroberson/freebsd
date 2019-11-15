@@ -215,6 +215,8 @@ db_putc(int c)
 	    /* No need to beep in a log: db_capture_writech(c); */
 	}
 	/* other characters are assumed non-printing */
+	if (db_output_position >= db_max_width)
+		db_putc('\n');
 }
 
 static void
