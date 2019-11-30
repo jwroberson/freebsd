@@ -1631,6 +1631,23 @@ vm_page_busy_release(vm_page_t m)
 }
 
 /*
+ *	vm_page_cached:
+ *
+ *	Return true if the page might be cached.  No lock is required.
+ */
+bool
+vm_page_cached(vm_object_t object, vm_pindex_t pindex)
+{
+	vm_page_t m;
+
+	m = vm_radix_lookup_unlocked(&object->rtree, pindex);
+	if (m != NULL && vm_page_all_valid(m))
+		return (true);
+	return (false);
+
+}
+
+/*
  *	vm_page_find_least:
  *
  *	Returns the page associated with the object with least pindex
@@ -4368,9 +4385,9 @@ out:
  *
  * (true, *mp != NULL) - The operation was successful.
  * (true, *mp == NULL) - The page was not found in tree.
- * (false, *mp == NULL) - WAITFAIL or NOWAIT prevented acquisition.
+ * (false, *mp != NULL) - WAITFAIL or NOWAIT prevented acquisition.
  */
-static bool
+bool
 vm_page_acquire_unlocked(vm_object_t object, vm_pindex_t pindex,
     vm_page_t prev, vm_page_t *mp, int allocflags)
 {
@@ -4379,7 +4396,6 @@ vm_page_acquire_unlocked(vm_object_t object, vm_pindex_t pindex,
 	vm_page_grab_check(allocflags);
 	MPASS(prev == NULL || vm_page_busied(prev) || vm_page_wired(prev));
 
-	*mp = NULL;
 	for (;;) {
 		/*
 		 * We may see a false NULL here because the previous page
@@ -4396,6 +4412,7 @@ vm_page_acquire_unlocked(vm_object_t object, vm_pindex_t pindex,
 			 */
 			m = vm_radix_lookup_unlocked(&object->rtree, pindex);
 		}
+		*mp = m;
 		if (m == NULL)
 			return (true);
 		if (vm_page_trybusy(m, allocflags)) {
@@ -4411,7 +4428,7 @@ vm_page_acquire_unlocked(vm_object_t object, vm_pindex_t pindex,
 			return (false);
 	}
 	vm_page_grab_release(m, allocflags);
-	*mp = m;
+
 	return (true);
 }
 
@@ -5102,7 +5119,7 @@ vm_page_invalid(vm_page_t m)
 {
 
 	vm_page_assert_busied(m);
-	VM_OBJECT_ASSERT_LOCKED(m->object);
+	VM_OBJECT_ASSERT_WLOCKED(m->object);
 	MPASS(!pmap_page_is_mapped(m));
 
 	if (vm_page_xbusied(m))
