@@ -589,6 +589,7 @@ malloc2vm_flags(int malloc_flags)
 
 bool vm_page_busy_acquire(vm_page_t m, int allocflags);
 void vm_page_busy_downgrade(vm_page_t m);
+void vm_page_busy_release(vm_page_t m);
 int vm_page_busy_tryupgrade(vm_page_t m);
 void vm_page_busy_sleep(vm_page_t m, const char *msg, bool nonshared);
 void vm_page_busy_sleep_unlocked(vm_object_t obj, vm_page_t m,
@@ -614,6 +615,7 @@ vm_page_t vm_page_alloc_freelist(int, int);
 vm_page_t vm_page_alloc_freelist_domain(int, int, int);
 void vm_page_bits_set(vm_page_t m, vm_page_bits_t *bits, vm_page_bits_t set);
 bool vm_page_blacklist_add(vm_paddr_t pa, bool verbose);
+bool vm_page_cached(vm_object_t, vm_pindex_t);
 vm_page_t vm_page_grab(vm_object_t, vm_pindex_t, int);
 vm_page_t vm_page_grab_unlocked(vm_object_t, vm_pindex_t, int);
 int vm_page_grab_pages(vm_object_t object, vm_pindex_t pindex, int allocflags,

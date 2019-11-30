@@ -1722,7 +1722,7 @@ vm_page_lookup(vm_object_t object, vm_pindex_t pindex)
  * busy lock.  In this case busy_lock == VPB_FREED and we have nothing
  * further to do.
  */
-static void
+void
 vm_page_busy_release(vm_page_t m)
 {
 	u_int x;
@@ -1746,6 +1746,23 @@ vm_page_busy_release(vm_page_t m)
 			wakeup(m);
 		break;
 	}
+}
+
+/*
+ *	vm_page_cached:
+ *
+ *	Return true if the page might be cached.  No lock is required.
+ */
+bool
+vm_page_cached(vm_object_t object, vm_pindex_t pindex)
+{
+	vm_page_t m;
+
+	m = vm_radix_lookup_unlocked(&object->rtree, pindex);
+	if (m != NULL && vm_page_all_valid(m))
+		return (true);
+	return (false);
+
 }
 
 /*
@@ -5155,7 +5172,7 @@ vm_page_invalid(vm_page_t m)
 {
 
 	vm_page_assert_busied(m);
-	VM_OBJECT_ASSERT_LOCKED(m->object);
+	VM_OBJECT_ASSERT_WLOCKED(m->object);
 	MPASS(!pmap_page_is_mapped(m));
 
 	if (vm_page_xbusied(m))

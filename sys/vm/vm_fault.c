@@ -106,6 +106,7 @@ __FBSDID("$FreeBSD$");
 #include <vm/vm_object.h>
 #include <vm/vm_page.h>
 #include <vm/vm_pageout.h>
+#include <vm/vm_radix.h>
 #include <vm/vm_kern.h>
 #include <vm/vm_pager.h>
 #include <vm/vm_extern.h>
@@ -310,11 +311,13 @@ vm_fault_soft_fast(struct faultstate *fs)
 
 	MPASS(fs->vp == NULL);
 	vaddr = fs->vaddr;
+	VM_OBJECT_RLOCK(fs->first_object);
 	vm_object_busy(fs->first_object);
 	m = vm_page_lookup(fs->first_object, fs->first_pindex);
 	/* A busy page can be mapped for read|execute access. */
 	if (m == NULL || ((fs->prot & VM_PROT_WRITE) != 0 &&
 	    vm_page_busied(m)) || !vm_page_all_valid(m)) {
+		VM_OBJECT_RUNLOCK(fs->first_object);
 		rv = KERN_FAILURE;
 		goto out;
 	}
@@ -354,8 +357,10 @@ vm_fault_soft_fast(struct faultstate *fs)
 #endif
 	rv = pmap_enter(fs->map->pmap, vaddr, m_map, fs->prot, fs->fault_type |
 	    PMAP_ENTER_NOSLEEP | (fs->wired ? PMAP_ENTER_WIRED : 0), psind);
-	if (rv != KERN_SUCCESS)
+	if (rv != KERN_SUCCESS) {
+		VM_OBJECT_RUNLOCK(fs->first_object);
 		goto out;
+	}
 	if (fs->m_hold != NULL) {
 		(*fs->m_hold) = m;
 		vm_page_wire(m);
@@ -964,12 +969,20 @@ vm_fault_next(struct faultstate *fs)
 		return (false);
 	MPASS(fs->first_m != NULL);
 	KASSERT(fs->object != next_object, ("object loop %p", next_object));
-	VM_OBJECT_WLOCK(next_object);
+	fs->pindex += OFF_TO_IDX(fs->object->backing_object_offset);
+	/*
+	 * We must do this lookup while the parent object is locked.
+	 * Otherwise a concurrent vm_object_collapse() could move the
+	 * page from next_object to object while we have both unlocked
+	 * and we would skip over the page we're looking for.
+	 */
+	fs->m = vm_radix_lookup_unlocked(&next_object->rtree, fs->pindex);
+	if (fs->m == NULL)
+		VM_OBJECT_WLOCK(next_object);
 	vm_object_pip_add(next_object, 1);
+	VM_OBJECT_WUNLOCK(fs->object);
 	if (fs->object != fs->first_object)
 		vm_object_pip_wakeup(fs->object);
-	fs->pindex += OFF_TO_IDX(fs->object->backing_object_offset);
-	VM_OBJECT_WUNLOCK(fs->object);
 	fs->object = next_object;
 
 	return (true);
@@ -1190,24 +1203,26 @@ vm_fault_getpages(struct faultstate *fs, int nera, int *behindp, int *aheadp)
  * page except, perhaps, to pmap it.
  */
 static void
-vm_fault_busy_sleep(struct faultstate *fs)
+vm_fault_busy_sleep(struct faultstate *fs, bool locked)
 {
-	/*
-	 * Reference the page before unlocking and
-	 * sleeping so that the page daemon is less
-	 * likely to reclaim it.
-	 */
-	vm_page_aflag_set(fs->m, PGA_REFERENCED);
 	if (fs->object != fs->first_object) {
 		fault_page_release(&fs->first_m);
 		vm_object_pip_wakeup(fs->first_object);
 	}
 	vm_object_pip_wakeup(fs->object);
 	unlock_map(fs);
-	if (fs->m == vm_page_lookup(fs->object, fs->pindex))
+	if (locked) {
+		/*
+		 * Reference the page before unlocking and
+		 * sleeping so that the page daemon is less
+		 * likely to reclaim it.
+		 */
+		vm_page_aflag_set(fs->m, PGA_REFERENCED);
+		/* This drops fs->object's lock. */
 		vm_page_busy_sleep(fs->m, "vmpfw", false);
-	else
-		VM_OBJECT_WUNLOCK(fs->object);
+	} else
+		vm_page_busy_sleep_unlocked(fs->object, fs->m, fs->pindex,
+		    "vmpfw", false);
 	VM_CNT_INC(v_intrans);
 	vm_object_deallocate(fs->first_object);
 }
@@ -1259,17 +1274,11 @@ RetryFault:
 	 * multiple page faults of a similar type to run in parallel.
 	 */
 	if (fs.vp == NULL /* avoid locked vnode leak */ &&
+	    vm_page_cached(fs.first_object, fs.first_pindex) &&
 	    (fs.fault_flags & (VM_FAULT_WIRE | VM_FAULT_DIRTY)) == 0) {
-		VM_OBJECT_RLOCK(fs.first_object);
 		rv = vm_fault_soft_fast(&fs);
 		if (rv == KERN_SUCCESS)
 			return (rv);
-		if (!VM_OBJECT_TRYUPGRADE(fs.first_object)) {
-			VM_OBJECT_RUNLOCK(fs.first_object);
-			VM_OBJECT_WLOCK(fs.first_object);
-		}
-	} else {
-		VM_OBJECT_WLOCK(fs.first_object);
 	}
 
 	/*
@@ -1281,7 +1290,7 @@ RetryFault:
 	 * Bump the paging-in-progress count to prevent size changes (e.g. 
 	 * truncation operations) during I/O.
 	 */
-	vm_object_reference_locked(fs.first_object);
+	vm_object_reference(fs.first_object);
 	vm_object_pip_add(fs.first_object, 1);
 
 	fs.m_cow = fs.m = fs.first_m = NULL;
@@ -1291,9 +1300,37 @@ RetryFault:
 	 */
 	fs.object = fs.first_object;
 	fs.pindex = fs.first_pindex;
+	fs.first_m = NULL;
+	vm_object_busy_wait(fs.object, "pfbwt");
+	fs.m = vm_radix_lookup_unlocked(&fs.object->rtree, fs.pindex);
+	if (fs.m == NULL)
+		VM_OBJECT_WLOCK(fs.object);
 	while (TRUE) {
+		if (fs.m != NULL) {
+			if (!vm_page_tryxbusy(fs.m)) {
+				vm_fault_busy_sleep(&fs, false);
+				goto RetryFault;
+			}
+			if (fs.m->object != fs.object ||
+			    fs.m->pindex != fs.pindex) {
+				vm_page_busy_release(fs.m);
+				/* XXX Why sleep, the page is not busy? */
+				vm_fault_busy_sleep(&fs, false);
+				goto RetryFault;
+			}
+			if (vm_page_all_valid(fs.m))
+				break;
+			if (fs.object->type == OBJT_DEFAULT) {
+				VM_OBJECT_WLOCK(fs.object);
+				goto next;
+			}
+			goto readrest;
+		}
+
+		VM_OBJECT_ASSERT_WLOCKED(fs.object);
 		KASSERT(fs.m == NULL,
 		    ("page still set %p at loop start", fs.m));
+
 		/*
 		 * If the object is marked for imminent termination,
 		 * we retry here, since the collapse pass has raced
@@ -1315,7 +1352,7 @@ RetryFault:
 		fs.m = vm_page_lookup(fs.object, fs.pindex);
 		if (fs.m != NULL) {
 			if (vm_page_tryxbusy(fs.m) == 0) {
-				vm_fault_busy_sleep(&fs);
+				vm_fault_busy_sleep(&fs, true);
 				goto RetryFault;
 			}
 
@@ -1376,7 +1413,7 @@ RetryFault:
 			 * the object lock is dropped.
 		 	 */
 			VM_OBJECT_WUNLOCK(fs.object);
-
+readrest:
 			/*
 			 * If the pager for the current object might have
 			 * the page, then determine the number of additional
@@ -1395,7 +1432,7 @@ RetryFault:
 			if (rv == KERN_SUCCESS) {
 				faultcount = behind + 1 + ahead;
 				hardfault = true;
-				break; /* break to PAGE HAS BEEN FOUND. */
+				break;
 			}
 			if (rv == KERN_RESOURCE_SHORTAGE)
 				goto RetryFault;
@@ -1406,7 +1443,7 @@ RetryFault:
 				return (rv);
 			}
 		}
-
+next:
 		/*
 		 * The page was not found in the current object.  Try to
 		 * traverse into a backing object or zero fill if none is
