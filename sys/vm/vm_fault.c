@@ -129,8 +129,15 @@ struct faultstate {
 	vm_map_t map;
 	vm_map_entry_t entry;
 	int map_generation;
-	bool lookup_still_valid;
 	struct vnode *vp;
+	vm_offset_t vaddr;
+	vm_page_t *m_hold;
+	vm_prot_t fault_type;
+	vm_prot_t prot;
+	int fault_flags;
+	bool lookup_still_valid;
+	bool wired;
+	int oom;
 };
 
 static void vm_fault_dontneed(const struct faultstate *fs, vm_offset_t vaddr,
@@ -406,8 +413,7 @@ vm_fault_populate_cleanup(vm_object_t object, vm_pindex_t first,
 }
 
 static int
-vm_fault_populate(struct faultstate *fs, vm_prot_t prot, int fault_type,
-    int fault_flags, boolean_t wired, vm_page_t *m_hold)
+vm_fault_populate(struct faultstate *fs)
 {
 	struct mtx *m_mtx;
 	vm_offset_t vaddr;
@@ -435,7 +441,8 @@ vm_fault_populate(struct faultstate *fs, vm_prot_t prot, int fault_type,
 	 * to the driver.
 	 */
 	rv = vm_pager_populate(fs->first_object, fs->first_pindex,
-	    fault_type, fs->entry->max_protection, &pager_first, &pager_last);
+	    fs->fault_type, fs->entry->max_protection, &pager_first,
+	    &pager_last);
 
 	VM_OBJECT_ASSERT_WLOCKED(fs->first_object);
 	if (rv == VM_PAGER_BAD) {
@@ -492,9 +499,9 @@ vm_fault_populate(struct faultstate *fs, vm_prot_t prot, int fault_type,
 #if defined(__aarch64__) || defined(__amd64__) || (defined(__arm__) && \
     __ARM_ARCH >= 6) || defined(__i386__) || defined(__riscv)
 		psind = m->psind;
-		if (psind > 0 && ((vaddr & (pagesizes[psind] - 1)) != 0 ||
+		if (psind > 0 && ((fs->vaddr & (pagesizes[psind] - 1)) != 0 ||
 		    pidx + OFF_TO_IDX(pagesizes[psind]) - 1 > pager_last ||
-		    !pmap_ps_enabled(fs->map->pmap) || wired))
+		    !pmap_ps_enabled(fs->map->pmap) || fs->wired))
 			psind = 0;
 #else
 		psind = 0;
@@ -502,18 +509,20 @@ vm_fault_populate(struct faultstate *fs, vm_prot_t prot, int fault_type,
 		npages = atop(pagesizes[psind]);
 		for (i = 0; i < npages; i++) {
 			vm_fault_populate_check_page(&m[i]);
-			vm_fault_dirty(fs->entry, &m[i], prot, fault_type,
-			    fault_flags, true);
+			vm_fault_dirty(fs->entry, &m[i], fs->prot,
+			    fs->fault_type, fs->fault_flags, true);
 		}
 		VM_OBJECT_WUNLOCK(fs->first_object);
-		rv = pmap_enter(fs->map->pmap, vaddr, m, prot, fault_type |
-		    (wired ? PMAP_ENTER_WIRED : 0), psind);
+		rv = pmap_enter(fs->map->pmap, fs->vaddr, m, fs->prot,
+		    fs->fault_type | (fs->wired ? PMAP_ENTER_WIRED : 0),
+		    psind);
 #if defined(__amd64__)
 		if (psind > 0 && rv == KERN_FAILURE) {
 			for (i = 0; i < npages; i++) {
-				rv = pmap_enter(fs->map->pmap, vaddr + ptoa(i),
-				    &m[i], prot, fault_type |
-				    (wired ? PMAP_ENTER_WIRED : 0), 0);
+				rv = pmap_enter(fs->map->pmap,
+				    fs->vaddr + ptoa(i),
+				    &m[i], fs->prot, fs->fault_type |
+				    (fs->wired ? PMAP_ENTER_WIRED : 0), 0);
 				MPASS(rv == KERN_SUCCESS);
 			}
 		}
@@ -523,14 +532,14 @@ vm_fault_populate(struct faultstate *fs, vm_prot_t prot, int fault_type,
 		VM_OBJECT_WLOCK(fs->first_object);
 		m_mtx = NULL;
 		for (i = 0; i < npages; i++) {
-			if ((fault_flags & VM_FAULT_WIRE) != 0) {
+			if ((fs->fault_flags & VM_FAULT_WIRE) != 0) {
 				vm_page_wire(&m[i]);
 			} else {
 				vm_page_change_lock(&m[i], &m_mtx);
 				vm_page_activate(&m[i]);
 			}
-			if (m_hold != NULL && m[i].pindex == fs->first_pindex) {
-				*m_hold = &m[i];
+			if (fs->m_hold != NULL && m[i].pindex == fs->first_pindex) {
+				*(fs->m_hold) = &m[i];
 				vm_page_wire(&m[i]);
 			}
 			vm_page_xunbusy(&m[i]);
@@ -692,6 +701,97 @@ vm_fault_lock_vnode(struct faultstate *fs, bool objlocked)
 }
 
 /*
+ * Allocate a page for the current fault object in compliance with pager
+ * boundaries.
+ *
+ * Returns KERN_SUCCESS, KERN_FAILURE, and KERN_OUT_OF_BOUNDS should be
+ * returned to the top level caller.  KERN_RESOURCE_SHORTAGE signals a
+ * fault restart is necessary.  KERN_JUSTRETURN means we proceeded through
+ * page allocation.  It may have failed if fs.m == NULL.
+ */
+static int
+vm_fault_allocate(struct faultstate *fs)
+{
+	struct domainset *dset;
+	int alloc_req, rv;
+
+	VM_OBJECT_ASSERT_WLOCKED(fs->object);
+
+	if ((fs->object->flags & OBJ_SIZEVNLOCK) != 0) {
+		rv = vm_fault_lock_vnode(fs, true);
+		MPASS(rv == KERN_SUCCESS || rv == KERN_RESOURCE_SHORTAGE);
+		if (rv == KERN_RESOURCE_SHORTAGE)
+			return (rv);
+	}
+	if (fs->pindex >= fs->object->size) {
+		unlock_and_deallocate(fs);
+		return (KERN_OUT_OF_BOUNDS);
+	}
+
+	if (fs->object == fs->first_object &&
+	    (fs->first_object->flags & OBJ_POPULATE) != 0) {
+		rv = vm_fault_populate(fs);
+		switch (rv) {
+		case KERN_SUCCESS:
+		case KERN_FAILURE:
+		case KERN_RESOURCE_SHORTAGE:
+			unlock_and_deallocate(fs);
+			return (rv);
+		case KERN_NOT_RECEIVER:
+			/*
+			 * Pager's populate() method
+			 * returned VM_PAGER_BAD.
+			 */
+			break;
+		default:
+			panic("inconsistent return codes");
+		}
+	}
+
+	/*
+	 * Allocate a new page for this object/offset pair.
+	 *
+	 * Unlocked read of the p_flag is harmless. At
+	 * worst, the P_KILLED might be not observed
+	 * there, and allocation can fail, causing
+	 * restart and new reading of the p_flag.
+	 */
+	dset = fs->object->domain.dr_policy;
+	if (dset == NULL)
+		dset = curthread->td_domain.dr_policy;
+	if (!vm_page_count_severe_set(&dset->ds_mask) || P_KILLED(curproc)) {
+#if VM_NRESERVLEVEL > 0
+		vm_object_color(fs->object, atop(fs->vaddr) - fs->pindex);
+#endif
+		alloc_req = P_KILLED(curproc) ?
+		    VM_ALLOC_SYSTEM : VM_ALLOC_NORMAL;
+		if (fs->object->type != OBJT_VNODE &&
+		    fs->object->backing_object == NULL)
+			alloc_req |= VM_ALLOC_ZERO;
+		fs->m = vm_page_alloc(fs->object, fs->pindex, alloc_req);
+	}
+	if (fs->m == NULL) {
+		unlock_and_deallocate(fs);
+		if (vm_pfault_oom_attempts < 0 ||
+		    fs->oom < vm_pfault_oom_attempts) {
+			fs->oom++;
+			vm_waitpfault(dset, vm_pfault_oom_wait * hz);
+		} else {
+			fs->oom = 0;
+			if (bootverbose)
+				printf("proc %d (%s) failed to alloc page "
+				    "on fault, starting OOM\n",
+				    curproc->p_pid, curproc->p_comm);
+			vm_pageout_oom(VM_OOM_MEM_PF);
+		}
+		return (KERN_RESOURCE_SHORTAGE);
+	}
+	fs->oom = 0;
+
+	return (KERN_JUSTRETURN);
+}
+
+/*
  * Wait/Retry if the page is busy.  We have to do this
  * if the page is either exclusive or shared busy
  * because the vm_pager may be using read busy for
@@ -743,13 +843,12 @@ vm_fault(vm_map_t map, vm_offset_t vaddr, vm_prot_t fault_type,
     int fault_flags, vm_page_t *m_hold)
 {
 	struct faultstate fs;
-	struct domainset *dset;
 	vm_object_t next_object, retry_object;
 	vm_offset_t e_end, e_start;
 	vm_pindex_t retry_pindex;
 	vm_prot_t prot, retry_prot;
-	int ahead, alloc_req, behind, cluster_offset, era, faultcount;
-	int nera, oom, result, rv;
+	int ahead, behind, cluster_offset, era, faultcount;
+	int nera, result, rv;
 	u_char behavior;
 	boolean_t wired;	/* Passed by reference. */
 	bool dead, hardfault, is_first_object_locked;
@@ -760,14 +859,12 @@ vm_fault(vm_map_t map, vm_offset_t vaddr, vm_prot_t fault_type,
 		return (KERN_PROTECTION_FAILURE);
 
 	fs.vp = NULL;
+	fs.oom = 0;
 	faultcount = 0;
 	nera = -1;
 	hardfault = false;
 
 RetryFault:
-	oom = 0;
-RetryFault_oom:
-
 	/*
 	 * Find the backing store object and offset into it to begin the
 	 * search.
@@ -845,8 +942,13 @@ RetryFault_oom:
 	vm_object_pip_add(fs.first_object, 1);
 
 	fs.lookup_still_valid = true;
-
 	fs.first_m = NULL;
+	fs.vaddr = vaddr;
+	fs.fault_flags = fault_flags;
+	fs.prot = prot;
+	fs.m_hold = m_hold;
+	fs.fault_type = fault_type;
+	fs.wired = wired;
 
 	/*
 	 * Search for the page at object/offset.
@@ -902,83 +1004,20 @@ RetryFault_oom:
 		 */
 		if (fs.object->type != OBJT_DEFAULT ||
 		    fs.object == fs.first_object) {
-			if ((fs.object->flags & OBJ_SIZEVNLOCK) != 0) {
-				rv = vm_fault_lock_vnode(&fs, true);
-				MPASS(rv == KERN_SUCCESS ||
-				    rv == KERN_RESOURCE_SHORTAGE);
-				if (rv == KERN_RESOURCE_SHORTAGE)
-					goto RetryFault;
-			}
-			if (fs.pindex >= fs.object->size) {
-				unlock_and_deallocate(&fs);
-				return (KERN_OUT_OF_BOUNDS);
-			}
-
-			if (fs.object == fs.first_object &&
-			    (fs.first_object->flags & OBJ_POPULATE) != 0 &&
-			    fs.first_object->shadow_count == 0) {
-				rv = vm_fault_populate(&fs, prot, fault_type,
-				    fault_flags, wired, m_hold);
-				switch (rv) {
-				case KERN_SUCCESS:
-				case KERN_FAILURE:
-					unlock_and_deallocate(&fs);
-					return (rv);
-				case KERN_RESOURCE_SHORTAGE:
-					unlock_and_deallocate(&fs);
-					goto RetryFault;
-				case KERN_NOT_RECEIVER:
-					/*
-					 * Pager's populate() method
-					 * returned VM_PAGER_BAD.
-					 */
-					break;
-				default:
-					panic("inconsistent return codes");
-				}
-			}
-
-			/*
-			 * Allocate a new page for this object/offset pair.
-			 *
-			 * Unlocked read of the p_flag is harmless. At
-			 * worst, the P_KILLED might be not observed
-			 * there, and allocation can fail, causing
-			 * restart and new reading of the p_flag.
-			 */
-			dset = fs.object->domain.dr_policy;
-			if (dset == NULL)
-				dset = curthread->td_domain.dr_policy;
-			if (!vm_page_count_severe_set(&dset->ds_mask) ||
-			    P_KILLED(curproc)) {
-#if VM_NRESERVLEVEL > 0
-				vm_object_color(fs.object, atop(vaddr) -
-				    fs.pindex);
-#endif
-				alloc_req = P_KILLED(curproc) ?
-				    VM_ALLOC_SYSTEM : VM_ALLOC_NORMAL;
-				if (fs.object->type != OBJT_VNODE &&
-				    fs.object->backing_object == NULL)
-					alloc_req |= VM_ALLOC_ZERO;
-				fs.m = vm_page_alloc(fs.object, fs.pindex,
-				    alloc_req);
-			}
-			if (fs.m == NULL) {
-				unlock_and_deallocate(&fs);
-				if (vm_pfault_oom_attempts < 0 ||
-				    oom < vm_pfault_oom_attempts) {
-					oom++;
-					vm_waitpfault(dset,
-					    vm_pfault_oom_wait * hz);
-					goto RetryFault_oom;
-				}
-				if (bootverbose)
-					printf(
-	"proc %d (%s) failed to alloc page on fault, starting OOM\n",
-					    curproc->p_pid, curproc->p_comm);
-				vm_pageout_oom(VM_OOM_MEM_PF);
+			rv = vm_fault_allocate(&fs);
+			switch (rv) {
+			case KERN_SUCCESS:
+			case KERN_FAILURE:
+			case KERN_OUT_OF_BOUNDS:
+				return (rv);
+			case KERN_RESOURCE_SHORTAGE:
 				goto RetryFault;
+			case KERN_JUSTRETURN:
+				break;
+			default:
+				panic("vm_fault: Unhandled return %d", rv);
 			}
+			MPASS(fs.m != NULL);
 		}
 
 readrest:
