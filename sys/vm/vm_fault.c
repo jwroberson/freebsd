@@ -691,6 +691,53 @@ vm_fault_lock_vnode(struct faultstate *fs, bool objlocked)
 	return (KERN_RESOURCE_SHORTAGE);
 }
 
+/*
+ * Wait/Retry if the page is busy.  We have to do this
+ * if the page is either exclusive or shared busy
+ * because the vm_pager may be using read busy for
+ * pageouts (and even pageins if it is the vnode
+ * pager), and we could end up trying to pagein and
+ * pageout the same page simultaneously.
+ *
+ * We can theoretically allow the busy case on a read
+ * fault if the page is marked valid, but since such
+ * pages are typically already pmap'd, putting that
+ * special case in might be more effort then it is 
+ * worth.  We cannot under any circumstances mess
+ * around with a shared busied page except, perhaps,
+ * to pmap it.
+ */
+static void
+vm_fault_busy_sleep(struct faultstate *fs)
+{
+	/*
+	 * Reference the page before unlocking and
+	 * sleeping so that the page daemon is less
+	 * likely to reclaim it.
+	 */
+	vm_page_aflag_set(fs->m, PGA_REFERENCED);
+	if (fs->object != fs->first_object) {
+		/*
+		 * We will loop again and attempt to reallocate
+		 * this page so just put it on the inactive
+		 * queue for now.
+		 */
+                vm_page_lock(fs->first_m);
+                vm_page_deactivate(fs->first_m);
+                vm_page_unlock(fs->first_m);
+                vm_page_xunbusy(fs->first_m);
+		vm_object_pip_wakeup(fs->first_object);
+		fs->first_m = NULL;
+	}
+	unlock_map(fs);
+	if (fs->m == vm_page_lookup(fs->object, fs->pindex))
+		vm_page_sleep_if_busy(fs->m, "vmpfw");
+	vm_object_pip_wakeup(fs->object);
+	VM_OBJECT_WUNLOCK(fs->object);
+	VM_CNT_INC(v_intrans);
+	vm_object_deallocate(fs->first_object);
+}
+
 int
 vm_fault(vm_map_t map, vm_offset_t vaddr, vm_prot_t fault_type,
     int fault_flags, vm_page_t *m_hold)
@@ -816,6 +863,7 @@ RetryFault_oom:
 		if ((fs.object->flags & OBJ_DEAD) != 0) {
 			dead = fs.object->type == OBJT_DEAD;
 			unlock_and_deallocate(&fs);
+			KASSERT(!dead, ("OBJT_DEAD referenced"));
 			if (dead)
 				return (KERN_PROTECTION_FAILURE);
 			pause("vmf_de", 1);
@@ -827,50 +875,8 @@ RetryFault_oom:
 		 */
 		fs.m = vm_page_lookup(fs.object, fs.pindex);
 		if (fs.m != NULL) {
-			/*
-			 * Wait/Retry if the page is busy.  We have to do this
-			 * if the page is either exclusive or shared busy
-			 * because the vm_pager may be using read busy for
-			 * pageouts (and even pageins if it is the vnode
-			 * pager), and we could end up trying to pagein and
-			 * pageout the same page simultaneously.
-			 *
-			 * We can theoretically allow the busy case on a read
-			 * fault if the page is marked valid, but since such
-			 * pages are typically already pmap'd, putting that
-			 * special case in might be more effort then it is 
-			 * worth.  We cannot under any circumstances mess
-			 * around with a shared busied page except, perhaps,
-			 * to pmap it.
-			 */
 			if (vm_page_tryxbusy(fs.m) == 0) {
-				/*
-				 * Reference the page before unlocking and
-				 * sleeping so that the page daemon is less
-				 * likely to reclaim it.
-				 */
-				vm_page_aflag_set(fs.m, PGA_REFERENCED);
-				if (fs.object != fs.first_object) {
-					if (!VM_OBJECT_TRYWLOCK(
-					    fs.first_object)) {
-						VM_OBJECT_WUNLOCK(fs.object);
-						VM_OBJECT_WLOCK(fs.first_object);
-						VM_OBJECT_WLOCK(fs.object);
-					}
-					vm_page_free(fs.first_m);
-					vm_object_pip_wakeup(fs.first_object);
-					VM_OBJECT_WUNLOCK(fs.first_object);
-					fs.first_m = NULL;
-				}
-				unlock_map(&fs);
-				if (fs.m == vm_page_lookup(fs.object,
-				    fs.pindex)) {
-					vm_page_sleep_if_busy(fs.m, "vmpfw");
-				}
-				vm_object_pip_wakeup(fs.object);
-				VM_OBJECT_WUNLOCK(fs.object);
-				VM_CNT_INC(v_intrans);
-				vm_object_deallocate(fs.first_object);
+				vm_fault_busy_sleep(&fs);
 				goto RetryFault;
 			}
 
@@ -1256,7 +1262,6 @@ next:
 			 */
 			 fs.object == fs.first_object->backing_object &&
 			    VM_OBJECT_TRYWLOCK(fs.object)) {
-
 				(void)vm_page_remove(fs.m);
 				vm_page_replace_checked(fs.m, fs.first_object,
 				    fs.first_pindex, fs.first_m);
