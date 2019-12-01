@@ -4380,7 +4380,9 @@ retrylookup:
 	vm_page_assert_xbusied(m);
 	MPASS(xbusy);
 	if (vm_pager_has_page(object, pindex, NULL, NULL)) {
+		VM_OBJECT_WUNLOCK(object);
 		rv = vm_pager_get_pages(object, &m, 1, NULL, NULL);
+		VM_OBJECT_WLOCK(object);
 		if (rv != VM_PAGER_OK) {
 			if (allocflags & VM_ALLOC_WIRED)
 				vm_page_unwire_noq(m);

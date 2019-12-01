@@ -153,10 +153,9 @@ sg_pager_getpages(vm_object_t object, vm_page_t *m, int count, int *rbehind,
 
 	/* Since our haspage reports zero after/before, the count is 1. */
 	KASSERT(count == 1, ("%s: count %d", __func__, count));
-	VM_OBJECT_ASSERT_WLOCKED(object);
+	/* Handle is stable while paging is in progress. */
 	sg = object->handle;
 	memattr = object->memattr;
-	VM_OBJECT_WUNLOCK(object);
 	offset = m[0]->pindex;
 
 	/*
@@ -197,6 +196,7 @@ sg_pager_getpages(vm_object_t object, vm_page_t *m, int count, int *rbehind,
 	vm_page_lock(m[0]);
 	vm_page_free(m[0]);
 	vm_page_unlock(m[0]);
+	VM_OBJECT_WUNLOCK(object);
 	m[0] = page;
 	vm_page_valid(page);
 

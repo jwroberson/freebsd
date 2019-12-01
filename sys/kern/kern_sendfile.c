@@ -421,9 +421,11 @@ sendfile_swapin(vm_object_t obj, struct sf_io *sfio, int *nios, off_t off,
 			}
 
 		refcount_acquire(&sfio->nios);
+		VM_OBJECT_WUNLOCK(obj);
 		rv = vm_pager_get_pages_async(obj, pa + i, count, NULL,
 		    i + count == npages ? &rhpages : NULL,
 		    &sendfile_iodone, sfio);
+		VM_OBJECT_WLOCK(obj);
 		if (__predict_false(rv != VM_PAGER_OK)) {
 			/*
 			 * Perform full pages recovery before returning EIO.

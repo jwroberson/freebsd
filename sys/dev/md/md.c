@@ -1065,12 +1065,14 @@ mdstart_swap(struct md_s *sc, struct bio *bp)
 	for (i = bp->bio_offset / PAGE_SIZE; i <= lastp; i++) {
 		len = ((i == lastp) ? lastend : PAGE_SIZE) - offs;
 		m = vm_page_grab(sc->object, i, VM_ALLOC_SYSTEM);
+		VM_OBJECT_WUNLOCK(sc->object);
 		if (bp->bio_cmd == BIO_READ) {
 			if (vm_page_all_valid(m))
 				rv = VM_PAGER_OK;
 			else
 				rv = vm_pager_get_pages(sc->object, &m, 1,
 				    NULL, NULL);
+			VM_OBJECT_WLOCK(sc->object);
 			if (rv == VM_PAGER_ERROR) {
 				vm_page_free(m);
 				break;
@@ -1101,6 +1103,7 @@ mdstart_swap(struct md_s *sc, struct bio *bp)
 			else
 				rv = vm_pager_get_pages(sc->object, &m, 1,
 				    NULL, NULL);
+			VM_OBJECT_WLOCK(sc->object);
 			if (rv == VM_PAGER_ERROR) {
 				vm_page_free(m);
 				break;
@@ -1128,6 +1131,7 @@ mdstart_swap(struct md_s *sc, struct bio *bp)
 			else
 				rv = vm_pager_get_pages(sc->object, &m, 1,
 				    NULL, NULL);
+			VM_OBJECT_WLOCK(sc->object);
 			if (rv == VM_PAGER_ERROR) {
 				vm_page_free(m);
 				break;
@@ -1148,7 +1152,8 @@ mdstart_swap(struct md_s *sc, struct bio *bp)
 					m = NULL;
 				}
 			}
-		}
+		} else
+			VM_OBJECT_WLOCK(sc->object);
 		if (m != NULL) {
 			vm_page_xunbusy(m);
 			vm_page_lock(m);

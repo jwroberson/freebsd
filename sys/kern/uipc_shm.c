@@ -505,8 +505,10 @@ retry:
 				    VM_ALLOC_NORMAL | VM_ALLOC_WAITFAIL);
 				if (m == NULL)
 					goto retry;
+				VM_OBJECT_WUNLOCK(object);
 				rv = vm_pager_get_pages(object, &m, 1, NULL,
 				    NULL);
+				VM_OBJECT_WLOCK(object);
 				if (rv == VM_PAGER_OK) {
 					/*
 					 * Since the page was not resident,

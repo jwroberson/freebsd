@@ -1026,7 +1026,9 @@ retry:
 			}
 		}
 		initial_pagein = i;
+		VM_OBJECT_WUNLOCK(object);
 		rv = vm_pager_get_pages(object, ma, initial_pagein, NULL, NULL);
+		VM_OBJECT_WLOCK(object);
 		if (rv != VM_PAGER_OK) {
 			if (vm_page_unwire_noq(ma[0]))
 				vm_page_free(ma[0]);
