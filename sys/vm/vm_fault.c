@@ -269,12 +269,10 @@ vm_fault_dirty(vm_map_entry_t entry, vm_page_t m, vm_prot_t prot,
 	 * the pager to release any swap backing the page.  Calling
 	 * the pager requires a write lock on the object.
 	 */
-	if (need_dirty)
-		vm_page_dirty(m);
 	if (!excl)
 		vm_page_unlock(m);
-	else if (need_dirty)
-		vm_pager_page_unswapped(m);
+	if (need_dirty)
+		vm_page_set_dirty(m, excl);
 }
 
 /*

@@ -1307,6 +1307,12 @@ act_scan:
 			act_delta++;
 		}
 
+		/* Deferred free of swap space. */
+		if ((m->aflags & PGA_UNSWAPPED) != 0) {
+			vm_pager_page_unswapped(m);
+			vm_page_aflag_clear(m, PGA_UNSWAPPED);
+		}
+
 		/*
 		 * Advance or decay the act_count based on recent usage.
 		 */
@@ -1540,6 +1546,12 @@ recheck:
 			 */
 			addl_page_shortage++;
 			goto reinsert;
+		}
+
+		/* Deferred free of swap space. */
+		if ((m->aflags & PGA_UNSWAPPED) != 0) {
+			vm_pager_page_unswapped(m);
+			vm_page_aflag_clear(m, PGA_UNSWAPPED);
 		}
 
 		/*
