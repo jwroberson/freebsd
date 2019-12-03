@@ -1463,7 +1463,6 @@ tmpfs_reg_resize(struct vnode *vp, off_t newsize, boolean_t ignerr)
 	    tmpfs_pages_check_avail(tmp, newpages - oldpages) == 0)
 		return (ENOSPC);
 
-	VM_OBJECT_WLOCK(uobj);
 	if (newsize < oldsize) {
 		/*
 		 * Zero the truncated part of the last page.
@@ -1471,20 +1470,23 @@ tmpfs_reg_resize(struct vnode *vp, off_t newsize, boolean_t ignerr)
 		base = newsize & PAGE_MASK;
 		if (base != 0) {
 			idx = OFF_TO_IDX(newsize);
-retry:
-			m = vm_page_grab(uobj, idx, VM_ALLOC_NOCREAT);
+			m = vm_page_grab_unlocked(uobj, idx, VM_ALLOC_NOCREAT);
 			if (m != NULL) {
 				MPASS(vm_page_all_valid(m));
-			} else if (vm_pager_has_page(uobj, idx, NULL, NULL)) {
-				m = vm_page_alloc(uobj, idx, VM_ALLOC_NORMAL |
-				    VM_ALLOC_WAITFAIL);
-				if (m == NULL)
-					goto retry;
+				goto found;
+			}
+			/*
+			 * XXX This could be handled more cleanly if fault
+			 * zeroed past the end of the object.
+			 */
+			VM_OBJECT_WLOCK(uobj);
+			if (vm_pager_has_page(uobj, idx, NULL, NULL)) {
+				/* XXX Valid race? */
+				m = vm_page_grab(uobj, idx, VM_ALLOC_NORMAL);
 				vm_object_pip_add(uobj, 1);
 				VM_OBJECT_WUNLOCK(uobj);
 				rv = vm_pager_get_pages(uobj, &m, 1, NULL,
 				    NULL);
-				VM_OBJECT_WLOCK(uobj);
 				vm_object_pip_wakeup(uobj);
 				if (rv == VM_PAGER_OK) {
 					/*
@@ -1496,31 +1498,33 @@ retry:
 					 * as an access.
 					 */
 					vm_page_launder(m);
-				} else {
-					vm_page_free(m);
-					if (ignerr)
-						m = NULL;
-					else {
-						VM_OBJECT_WUNLOCK(uobj);
-						return (EIO);
-					}
+					goto found;
 				}
-			}
+				VM_OBJECT_WLOCK(uobj);
+				vm_page_free(m);
+				VM_OBJECT_WUNLOCK(uobj);
+				if (ignerr)
+					m = NULL;
+				else
+					return (EIO);
+			} else
+				VM_OBJECT_WUNLOCK(uobj);
 			if (m != NULL) {
+found:
 				pmap_zero_page_area(m, base, PAGE_SIZE - base);
 				vm_page_set_dirty(m);
 				vm_page_xunbusy(m);
 			}
 		}
+	}
 
-		/*
-		 * Release any swap space and free any whole pages.
-		 */
-		if (newpages < oldpages) {
-			swap_pager_freespace(uobj, newpages, oldpages -
-			    newpages);
-			vm_object_page_remove(uobj, newpages, 0, 0);
-		}
+	/*
+	 * Release any swap space and free any whole pages.
+	 */
+	VM_OBJECT_WLOCK(uobj);
+	if (newpages < oldpages) {
+		swap_pager_freespace(uobj, newpages, oldpages - newpages);
+		vm_object_page_remove(uobj, newpages, 0, 0);
 	}
 	uobj->size = newpages;
 	VM_OBJECT_WUNLOCK(uobj);
