@@ -46,7 +46,10 @@
 #define	REFCOUNT_COUNT(x)		((x) & ~REFCOUNT_WAITER)
 
 bool refcount_release_last(volatile u_int *count, u_int n, u_int old);
-void refcount_sleep(volatile u_int *count, const char *wmesg, int prio);
+
+struct lock_object;
+void _refcount_sleep(volatile u_int *count, struct lock_object *,
+    const char *wmesg, int prio);
 
 /*
  * Attempt to handle reference count overflow and underflow.  Force the counter
@@ -134,6 +137,16 @@ refcount_release(volatile u_int *count)
 
 	return (refcount_releasen(count, 1));
 }
+
+static __inline void
+refcount_sleep(volatile u_int *count, const char *wmesg, int prio)
+{
+
+	_refcount_sleep(count, NULL, wmesg, prio);
+}
+
+#define	refcount_sleep_interlock(count, lock, wmesg, prio)		\
+	_refcount_sleep((count), (struct lock_object *)(lock), (wmesg), (prio))
 
 static __inline void
 refcount_wait(volatile u_int *count, const char *wmesg, int prio)
