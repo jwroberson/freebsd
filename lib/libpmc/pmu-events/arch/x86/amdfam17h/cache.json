@@ -155,6 +155,13 @@
  "UMask": "0x1"
  },
  {
+ "EventName": "ls_dc_misses",
+ "EventCode": "0x60",
+ "BriefDescription": "",
+ "PublicDescription": "",
+ "UMask": "0xc8"
+ },
+ {
  "EventName": "l2_request_g2.group1",
  "EventCode": "0x61",
  "BriefDescription": "All Group 1 commands not in unit0.",
