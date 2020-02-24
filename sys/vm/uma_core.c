@@ -235,7 +235,7 @@ struct uma_bucket_zone {
 #define	BUCKET_SIZE(n)						\
     (((sizeof(void *) * (n)) - sizeof(struct uma_bucket)) / sizeof(void *))
 
-#define	BUCKET_MAX	BUCKET_SIZE(512)
+#define	BUCKET_MAX	BUCKET_SIZE(128)
 #define	BUCKET_MIN	2
 
 struct uma_bucket_zone bucket_zones[] = {
@@ -370,6 +370,10 @@ TUNABLE_INT("vm.debug.uma_multipage_slabs", &multipage_slabs);
 SYSCTL_INT(_vm_debug, OID_AUTO, uma_multipage_slabs,
     CTLFLAG_RDTUN | CTLFLAG_NOFETCH, &multipage_slabs, 0,
     "UMA may choose larger slab sizes for better efficiency");
+
+static int uma_bucket_max = BUCKET_SIZE(256);
+SYSCTL_INT(_vm_debug, OID_AUTO, uma_bucket_max, CTLFLAG_RW, &uma_bucket_max, 0,
+    "");
 
 /*
  * Select the slab zone for an offpage slab with the given maximum item count.
@@ -737,6 +741,48 @@ out:
 	bucket_free(zone, bucket, udata);
 }
 
+static void
+zone_put_buckets(uma_zone_t zone, int domain, struct uma_bucketlist *batch,
+    void *udata, const bool ws)
+{
+	uma_zone_domain_t zdom;
+	uma_bucket_t bucket;
+	bool full;
+
+	zdom = zone_domain_lock(zone, domain);
+	full = false;
+	while (!STAILQ_EMPTY(batch)) {
+		KASSERT(!ws || zdom->uzd_nitems < zone->uz_bucket_max,
+		    ("%s: zone %p overflow", __func__, zone));
+		bucket = STAILQ_FIRST(batch);
+		STAILQ_REMOVE_HEAD(batch, ub_link);
+		if (full)
+			goto out;
+		/*
+		 * Conditionally set the maximum number of items.
+		 */
+		zdom->uzd_nitems += bucket->ub_cnt;
+		if (__predict_true(zdom->uzd_nitems < zone->uz_bucket_max)) {
+			if (STAILQ_EMPTY(&zdom->uzd_buckets))
+				zdom->uzd_seq = bucket->ub_seq;
+			STAILQ_INSERT_TAIL(&zdom->uzd_buckets, bucket, ub_link);
+			continue;
+		}
+		full = true;
+		zdom->uzd_nitems -= bucket->ub_cnt;
+		if (ws)
+			zone_domain_imax_set(zdom, zdom->uzd_nitems);
+		ZDOM_UNLOCK(zdom);
+out:
+		bucket_free(zone, bucket, udata);
+	}
+	if (!full) {
+		if (ws)
+			zone_domain_imax_set(zdom, zdom->uzd_nitems);
+		ZDOM_UNLOCK(zdom);
+	}
+}
+
 /* Pops an item out of a per-cpu cache bucket. */
 static inline void *
 cache_bucket_pop(uma_cache_t cache, uma_cache_bucket_t bucket)
@@ -885,6 +931,23 @@ cache_fetch_bucket(uma_zone_t zone, uma_cache_t cache, int domain)
 	uma_zone_domain_t zdom;
 	uma_bucket_t bucket;
 
+	KASSERT(!cache_stack_empty(cache) ||
+	    cache_stack_space(cache) == CACHE_STACK_SIZE - 1,
+	    ("cache_fetch_bucket: space != empty. %d, %d, space %d, empty %d",
+	    cache->uc_head, cache->uc_tail,
+	    cache_stack_space(cache), cache_stack_empty(cache)));
+	/* Use the local cache if any. */
+	if (!cache_stack_empty(cache)) {
+		bucket = cache_stack_pop(cache);
+		KASSERT(bucket != NULL,
+		    ("cache_fetch_bucket: NULL %d, %d, space %d, empty %d",
+		    cache->uc_head, cache->uc_tail,
+		    cache_stack_space(cache), cache_stack_empty(cache)));
+		KASSERT(bucket->ub_entries == bucket->ub_cnt,
+		    ("cache_fetch_bucket: Non-full bucket."));
+		return (bucket);
+	}
+
 	/*
 	 * Avoid the lock if possible.
 	 */
@@ -897,9 +960,12 @@ cache_fetch_bucket(uma_zone_t zone, uma_cache_t cache, int domain)
 		return (NULL);
 
 	/*
-	 * Check the zone's cache of buckets.
+	 * Check the zone's cache of buckets.  We may harmlessly migrate
+	 * here and cache_alloc() will handle it.
 	 */
+	critical_exit();
 	zdom = zone_domain_lock(zone, domain);
+	critical_enter();
 	if ((bucket = zone_fetch_bucket(zone, zdom, false)) != NULL) {
 		KASSERT(bucket->ub_cnt != 0,
 		    ("cache_fetch_bucket: Returning an empty bucket."));
@@ -1219,6 +1285,8 @@ cache_drain(uma_zone_t zone)
 			bucket->ub_seq = seq;
 			bucket_free(zone, bucket, NULL);
 		}
+		while (!cache_stack_empty(cache))
+			bucket_free(zone, cache_stack_pop(cache), NULL);
 	}
 	bucket_cache_reclaim(zone, true);
 }
@@ -2567,7 +2635,7 @@ zone_ctor(void *mem, int size, void *udata, int flags)
 	zone->uz_sleeps = 0;
 	zone->uz_bucket_size = 0;
 	zone->uz_bucket_size_min = 0;
-	zone->uz_bucket_size_max = BUCKET_MAX;
+	zone->uz_bucket_size_max = uma_bucket_max;
 	zone->uz_flags = (arg->flags & UMA_ZONE_SMR);
 	zone->uz_warning = NULL;
 	/* The domain structures follow the cpu structures. */
@@ -2690,7 +2758,7 @@ out:
 	if (arg->flags & UMA_ZFLAG_INTERNAL)
 		zone->uz_bucket_size_max = zone->uz_bucket_size = 0;
 	if ((arg->flags & UMA_ZONE_MAXBUCKET) != 0)
-		zone->uz_bucket_size = BUCKET_MAX;
+		zone->uz_bucket_size = uma_bucket_max;
 	else if ((arg->flags & UMA_ZONE_MINBUCKET) != 0)
 		zone->uz_bucket_size_max = zone->uz_bucket_size = BUCKET_MIN;
 	else if ((arg->flags & UMA_ZONE_NOBUCKET) != 0)
@@ -3394,6 +3462,9 @@ cache_alloc(uma_zone_t zone, uma_cache_t cache, void *udata, int flags)
 	 */
 	if ((cache_uz_flags(cache) & UMA_ZONE_SMR) == 0 &&
 	    cache->uc_freebucket.ucb_cnt != 0) {
+		KASSERT(cache->uc_freebucket.ucb_cnt == 
+		    cache->uc_freebucket.ucb_entries,
+		    ("cache_alloc: swapping to non-full free bucket"));
 		cache_bucket_swap(&cache->uc_freebucket,
 		    &cache->uc_allocbucket);
 		return (true);
@@ -3412,10 +3483,9 @@ cache_alloc(uma_zone_t zone, uma_cache_t cache, void *udata, int flags)
 	}
 
 	/* Short-circuit for zones without buckets and low memory. */
-	if (zone->uz_bucket_size == 0 || bucketdisable) {
-		critical_enter();
+	critical_enter();
+	if (zone->uz_bucket_size == 0 || bucketdisable)
 		return (false);
-	}
 
 	/*
 	 * Attempt to retrieve the item from the per-CPU cache has failed, so
@@ -3431,24 +3501,23 @@ cache_alloc(uma_zone_t zone, uma_cache_t cache, void *udata, int flags)
 		domain = zone_domain_highest(zone, domain);
 	bucket = cache_fetch_bucket(zone, cache, domain);
 	if (bucket == NULL) {
+		critical_exit();
 		bucket = zone_alloc_bucket(zone, udata, domain, flags);
+		critical_enter();
 		new = true;
 	} else
 		new = false;
 
 	CTR3(KTR_UMA, "uma_zalloc: zone %s(%p) bucket zone returned %p",
 	    zone->uz_name, zone, bucket);
-	if (bucket == NULL) {
-		critical_enter();
+	if (bucket == NULL)
 		return (false);
-	}
 
 	/*
 	 * See if we lost the race or were migrated.  Cache the
 	 * initialized bucket to make this less likely or claim
 	 * the memory directly.
 	 */
-	critical_enter();
 	cache = &zone->uz_cpu[curcpu];
 	if (cache->uc_allocbucket.ucb_bucket == NULL &&
 	    ((cache_uz_flags(cache) & UMA_ZONE_FIRSTTOUCH) == 0 ||
@@ -4106,9 +4175,12 @@ uma_zfree_arg(uma_zone_t zone, void *item, void *udata)
 #endif
 		if (bucket->ucb_cnt == bucket->ucb_entries &&
 		   cache->uc_freebucket.ucb_cnt <
-		   cache->uc_freebucket.ucb_entries)
+		   cache->uc_freebucket.ucb_entries) {
+			KASSERT(cache->uc_freebucket.ucb_cnt == 0, 
+			    ("uma_zfree: swapping to non-empty free bucket"));
 			cache_bucket_swap(&cache->uc_freebucket,
 			    &cache->uc_allocbucket);
+		}
 		if (__predict_true(bucket->ucb_cnt < bucket->ucb_entries)) {
 			cache_bucket_push(cache, bucket, item);
 			critical_exit();
@@ -4191,6 +4263,15 @@ zone_free_cross(uma_zone_t zone, uma_bucket_t bucket, void *udata)
 #endif
 
 static void
+zone_free_batch(uma_zone_t zone, struct uma_bucketlist *batch, void *udata,
+    int itemdomain, bool ws)
+{
+	if ((zone->uz_flags & UMA_ZONE_ROUNDROBIN) != 0)
+		itemdomain = zone_domain_lowest(zone, itemdomain);
+	zone_put_buckets(zone, itemdomain, batch, udata, ws);
+}
+
+static void
 zone_free_bucket(uma_zone_t zone, uma_bucket_t bucket, void *udata,
     int itemdomain, bool ws)
 {
@@ -4233,8 +4314,10 @@ static __noinline bool
 cache_free(uma_zone_t zone, uma_cache_t cache, void *udata, void *item,
     int itemdomain)
 {
-	uma_cache_bucket_t cbucket;
+	struct uma_bucketlist fullbuckets;
 	uma_bucket_t newbucket, bucket;
+	
+	STAILQ_INIT(&fullbuckets);
 
 	CRITICAL_ASSERT(curthread);
 
@@ -4249,18 +4332,31 @@ cache_free(uma_zone_t zone, uma_cache_t cache, void *udata, void *item,
 	 * enabled this is the zdom of the item.   The bucket is the
 	 * cross bucket if the current domain and itemdomain do not match.
 	 */
-	cbucket = &cache->uc_freebucket;
 #ifdef NUMA
-	if ((cache_uz_flags(cache) & UMA_ZONE_FIRSTTOUCH) != 0) {
-		if (PCPU_GET(domain) != itemdomain) {
-			cbucket = &cache->uc_crossbucket;
-			if (cbucket->ucb_cnt != 0)
-				counter_u64_add(zone->uz_xdomain,
-				    cbucket->ucb_cnt);
-		}
-	}
+	if ((cache_uz_flags(cache) & UMA_ZONE_FIRSTTOUCH) != 0 &&
+	    PCPU_GET(domain) != itemdomain) {
+		bucket = cache_bucket_unload_cross(cache);
+		if (bucket != NULL)
+			counter_u64_add(zone->uz_xdomain, bucket->ub_cnt);
+	} else
 #endif
-	bucket = cache_bucket_unload(cbucket);
+	if ((cache_uz_flags(cache) & UMA_ZONE_SMR) == 0) {
+		bucket = cache_bucket_unload_free(cache);
+		if (cache_stack_full(cache)) {
+			do {
+				newbucket = cache_stack_pop_tail(cache);
+				STAILQ_INSERT_HEAD(&fullbuckets, newbucket,
+				    ub_link);
+			} while (cache_stack_space(cache) < 2);
+		}
+		if (bucket != NULL)
+			cache_stack_push(cache, bucket);
+		bucket = newbucket = NULL;
+	} else {
+		bucket = cache_bucket_unload_free(cache);
+	}
+	if (bucket != NULL)
+		STAILQ_INSERT_HEAD(&fullbuckets, bucket, ub_link);
 	KASSERT(bucket == NULL || bucket->ub_cnt == bucket->ub_entries,
 	    ("cache_free: Entered with non-full free bucket."));
 
@@ -4281,12 +4377,13 @@ cache_free(uma_zone_t zone, uma_cache_t cache, void *udata, void *item,
 			bucket_drain(zone, bucket);
 			newbucket = bucket;
 			bucket = NULL;
+			STAILQ_INIT(&fullbuckets);
 		}
 	} else if (!bucketdisable)
 		newbucket = bucket_alloc(zone, udata, M_NOWAIT);
 
-	if (bucket != NULL)
-		zone_free_bucket(zone, bucket, udata, itemdomain, true);
+	if (!STAILQ_EMPTY(&fullbuckets))
+		zone_free_batch(zone, &fullbuckets, udata, itemdomain, true);
 
 	critical_enter();
 	if ((bucket = newbucket) == NULL)

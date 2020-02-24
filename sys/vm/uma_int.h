@@ -270,15 +270,74 @@ typedef struct uma_cache_bucket * uma_cache_bucket_t;
  * The uma_cache structure is allocated for each cpu for every zone
  * type.  This optimizes synchronization out of the allocator fast path.
  */
+#define	CACHE_STACK_SIZE	8
 struct uma_cache {
 	struct uma_cache_bucket	uc_freebucket;	/* Bucket we're freeing to */
 	struct uma_cache_bucket	uc_allocbucket;	/* Bucket to allocate from */
 	struct uma_cache_bucket	uc_crossbucket;	/* cross domain bucket */
 	uint64_t		uc_allocs;	/* Count of allocations */
 	uint64_t		uc_frees;	/* Count of frees */
+	int8_t			uc_head;
+	int8_t			uc_tail;
+	uma_bucket_t		uc_stack[CACHE_STACK_SIZE];
 } UMA_ALIGN;
 
+
 typedef struct uma_cache * uma_cache_t;
+
+
+static inline bool
+cache_stack_empty(uma_cache_t cache)
+{
+
+	return (cache->uc_head == cache->uc_tail);
+}
+
+static inline int
+cache_stack_space(uma_cache_t cache)
+{
+
+	return ((unsigned)(cache->uc_tail -
+	    cache->uc_head - 1) % CACHE_STACK_SIZE);
+}
+
+static inline bool
+cache_stack_full(uma_cache_t cache)
+{
+
+	return (cache_stack_space(cache) == 0);
+}
+
+
+static inline uma_bucket_t
+cache_stack_pop(uma_cache_t cache)
+{
+
+	cache->uc_head = (cache->uc_head + CACHE_STACK_SIZE - 1) %
+	    CACHE_STACK_SIZE;
+	return (cache->uc_stack[cache->uc_head]);
+}
+
+static inline uma_bucket_t
+cache_stack_pop_tail(uma_cache_t cache)
+{
+	uma_bucket_t bucket;
+
+	bucket = cache->uc_stack[cache->uc_tail++];
+	cache->uc_tail %= CACHE_STACK_SIZE;
+
+	return (bucket);
+}
+
+static inline void
+cache_stack_push(uma_cache_t cache, uma_bucket_t bucket)
+{
+
+	KASSERT(cache_stack_space(cache) != 0,
+	    ("cache_stack_push: No space in stack."));
+	cache->uc_stack[cache->uc_head++] = bucket;
+	cache->uc_head %= CACHE_STACK_SIZE;
+}
 
 LIST_HEAD(slabhead, uma_slab);
 
